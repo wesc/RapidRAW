@@ -149,6 +149,9 @@ pub fn is_tiff(file_bytes: &[u8]) -> bool {
 }
 
 pub fn read_exif(file_bytes: &[u8]) -> Option<Exif> {
+    if is_jxl_bytes(file_bytes) {
+        return read_jxl_exif(file_bytes);
+    }
     let exifreader = exif::Reader::new();
     if is_tiff(file_bytes) {
         let mut len = 64 * 1024;
@@ -162,6 +165,55 @@ pub fn read_exif(file_bytes: &[u8]) -> Option<Exif> {
     exifreader
         .read_from_container(&mut Cursor::new(file_bytes))
         .ok()
+}
+
+const JXL_CODESTREAM_SIGNATURE: &[u8] = &[0xFF, 0x0A];
+// ISOBMFF container signature box ("JXL " followed by 0D 0A 87 0A).
+const JXL_CONTAINER_SIGNATURE: &[u8] = b"\x00\x00\x00\x0C\x4A\x58\x4C\x20\x0D\x0A\x87\x0A";
+
+pub fn is_jxl_bytes(bytes: &[u8]) -> bool {
+    bytes.starts_with(JXL_CODESTREAM_SIGNATURE) || bytes.starts_with(JXL_CONTAINER_SIGNATURE)
+}
+
+fn read_jxl_exif(bytes: &[u8]) -> Option<Exif> {
+    use jxl::api::{Event, JxlAuxBoxType, JxlDecoder, JxlDecoderOptions};
+
+    // Only the ISOBMFF container can carry metadata boxes; a bare codestream has none.
+    if !bytes.starts_with(JXL_CONTAINER_SIGNATURE) {
+        return None;
+    }
+
+    let mut options = JxlDecoderOptions::default();
+    options.request_aux_boxes = vec![JxlAuxBoxType::EXIF];
+    options.scan_frames_only = true;
+    let mut decoder = JxlDecoder::new(options);
+    decoder.close_input();
+    let mut input = bytes;
+    let completed = loop {
+        match decoder.process(&mut input, None, None) {
+            Ok(Event::Complete) => break true,
+            Ok(Event::NeedMoreInput { .. }) => return None,
+            Ok(_) => {}
+            // A broken codestream does not invalidate an Exif box parsed before it.
+            Err(_) => break false,
+        }
+    };
+
+    // An Exif box that runs to the end of the file is reported as the trailing
+    // box, with the unconsumed input holding the rest of its data.
+    let data = match decoder.aux_boxes(JxlAuxBoxType::EXIF).first() {
+        Some(exif_box) => exif_box.data(&[]).ok()?,
+        None => decoder
+            .trailing_box()
+            .filter(|b| completed && b.box_type() == JxlAuxBoxType::EXIF)?
+            .data(input)
+            .ok()?,
+    };
+
+    // The Exif box payload starts with a big-endian offset to the TIFF header.
+    let offset = u32::from_be_bytes(data.get(..4)?.try_into().ok()?) as usize;
+    let tiff = data.get(4usize.checked_add(offset)?..)?;
+    exif::Reader::new().read_raw(tiff.to_vec()).ok()
 }
 
 pub fn read_exif_from_path(path: &Path) -> Option<Exif> {

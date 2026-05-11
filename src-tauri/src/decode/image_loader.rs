@@ -574,10 +574,15 @@ fn decode_with_orientation(
     let image = DynamicImage::from_decoder(decoder).context("Failed to decode image")?;
     check_cancel()?;
 
-    let exif = ExifReader::new()
-        .read_from_container(&mut cursor.clone())
-        .ok();
-    let oriented_image = match exif_orientation(exif.as_ref()) {
+    let exif = exif_processing::read_exif(bytes);
+    // The JPEG XL decoder already applies the codestream orientation, which the
+    // spec makes authoritative over any EXIF Orientation tag.
+    let exif_rotation = if exif_processing::is_jxl_bytes(bytes) {
+        None
+    } else {
+        exif_orientation(exif.as_ref())
+    };
+    let oriented_image = match exif_rotation {
         Some(orientation) => apply_orientation(image, orientation),
         None => image,
     };

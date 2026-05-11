@@ -3486,6 +3486,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8379fc83d79477900c9aed78cb8370a556d834081bebcb771c6010381c4e230"
 dependencies = [
  "array-init",
+ "brotli-decompressor 6.0.1",
  "byteorder",
  "jxl_macros",
  "jxl_simd",
