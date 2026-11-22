@@ -495,6 +495,7 @@ pub fn extract_metadata(file_bytes: &[u8]) -> Option<HashMap<String, String>> {
                             map.insert(field.tag.to_string(), truncate_large_exif(&val));
                         }
                     }
+                    _ if is_binary_blob(field) => {}
                     _ => {
                         let val = field.display_value().with_unit(&exif_obj).to_string();
                         if !val.trim().is_empty() {
@@ -871,6 +872,9 @@ pub fn read_exif_data_from_bytes(path: &str, file_bytes: &[u8]) -> HashMap<Strin
     let mut exif_data = HashMap::new();
     if let Some(exif) = read_exif(file_bytes) {
         for field in exif.fields() {
+            if is_binary_blob(field) {
+                continue;
+            }
             let raw_val = match &field.value {
                 exif::Value::Ascii(_) => match clean_ascii_value(&field.value) {
                     Some(v) => v,
@@ -916,6 +920,15 @@ pub fn get_rrexif_path(image_path: &Path) -> PathBuf {
     let mut filename = image_path.file_name().unwrap_or_default().to_os_string();
     filename.push(".rrexif");
     image_path.with_file_name(filename)
+}
+
+/// Large binary values (XMP packets, ICC profiles, Photoshop blocks, maker notes)
+/// are not human-readable and can be hundreds of KB, so they are left out of the
+/// metadata map. Short Byte/Undefined values (e.g. FileSource, SceneType) are
+/// fine to display, and UserComment is text the user can edit.
+fn is_binary_blob(field: &exif::Field) -> bool {
+    field.tag != exif::Tag::UserComment
+        && matches!(&field.value, Value::Byte(v) | Value::Undefined(v, _) if v.len() > 64)
 }
 
 pub fn truncate_large_exif(value: &str) -> String {
