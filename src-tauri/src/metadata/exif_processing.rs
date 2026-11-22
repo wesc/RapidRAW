@@ -216,6 +216,22 @@ fn read_jxl_exif(bytes: &[u8]) -> Option<Exif> {
     exif::Reader::new().read_raw(tiff.to_vec()).ok()
 }
 
+/// Extracts the XMP packet stored in EXIF tag 700 (0x02BC), as written by
+/// Lightroom and other tools into TIFF-based files (TIFF, DNG, NEF, ...) to
+/// carry ratings, color labels, and keywords.
+///
+/// JPEG files keep XMP in an APP1 segment rather than tag 700, so they are not
+/// covered here.
+pub fn extract_embedded_xmp(file_bytes: &[u8]) -> Option<String> {
+    let exif = read_exif(file_bytes)?;
+    let field = exif.get_field(exif::Tag(exif::Context::Tiff, 700), In::PRIMARY)?;
+    let bytes = match &field.value {
+        Value::Byte(v) | Value::Undefined(v, _) => v.as_slice(),
+        _ => return None,
+    };
+    String::from_utf8(bytes.to_vec()).ok()
+}
+
 pub fn read_exif_from_path(path: &Path) -> Option<Exif> {
     match file_ops::read_file_mapped(path) {
         Ok(mmap) => read_exif(&mmap),

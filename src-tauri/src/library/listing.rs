@@ -4,7 +4,10 @@ use crate::decode::formats::is_supported_image_file;
 use crate::library::file_ops::{is_cloud_placeholder, read_file_mapped};
 use crate::library::sidecars::{parse_sidecar_name, parse_virtual_path};
 use crate::metadata::sidecar::{ImageFlag, ImageMetadata, is_image_edited};
-use crate::metadata::xmp::{resolve_xmp_path, sync_metadata_from_xmp};
+use crate::metadata::xmp::{
+    apply_xmp_content_to_metadata, embedded_xmp_for_import, resolve_xmp_path,
+    sync_metadata_from_xmp,
+};
 use crate::render::options::resolve_tonemapper_override;
 use anyhow::Result;
 use rayon::prelude::*;
@@ -54,6 +57,20 @@ fn resolve_image_metadata(
     if enable_xmp_sync && sync_metadata_from_xmp(image_path, sidecar_path, &mut metadata) {
         let _ = crate::metadata::sidecar::update_sidecar(sidecar_path, image_path, |current| {
             sync_metadata_from_xmp(image_path, sidecar_path, current);
+        });
+    }
+
+    // With XMP sync enabled, seed ratings, labels, and keywords on first
+    // encounter (no .rrdata yet) from an XMP packet embedded in the image
+    // itself. An external .xmp sidecar takes precedence over the embedded packet.
+    if enable_xmp_sync
+        && !sidecar_exists
+        && resolve_xmp_path(image_path).is_none()
+        && let Some(xmp) = embedded_xmp_for_import(image_path, sidecar_path)
+        && apply_xmp_content_to_metadata(&xmp, &mut metadata)
+    {
+        let _ = crate::metadata::sidecar::update_sidecar(sidecar_path, image_path, |current| {
+            apply_xmp_content_to_metadata(&xmp, current);
         });
     }
 

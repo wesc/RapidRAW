@@ -110,57 +110,89 @@ pub fn sync_metadata_from_xmp(
         return false;
     }
 
-    let actual_xmp = resolve_xmp_path(source_path);
-
-    let mut changed = false;
-
-    if let Some(xmp_file) = actual_xmp
+    if let Some(xmp_file) = resolve_xmp_path(source_path)
         && let Ok(content) = fs::read_to_string(&xmp_file)
     {
-        let xmp_rating = extract_xmp_rating(&content);
+        return apply_xmp_content_to_metadata(&content, metadata);
+    }
+    false
+}
 
-        if xmp_rating == Some(XMP_REJECTED_RATING) && metadata.flag.is_none() {
-            metadata.flag = Some(ImageFlag::Reject);
-            changed = true;
-        }
+/// Merges the reject flag, rating, color label, and keywords from an XMP packet
+/// into `metadata`, without overriding a rating or flag that is already set.
+/// Returns `true` if anything changed.
+///
+/// Shared by the external `.xmp` sidecar sync and the embedded XMP packet import.
+pub fn apply_xmp_content_to_metadata(content: &str, metadata: &mut ImageMetadata) -> bool {
+    let mut changed = false;
 
-        if metadata.rating == 0
-            && let Some(rating) = xmp_rating.and_then(|r| u8::try_from(r).ok())
-            && rating != 0
-        {
-            metadata.rating = rating;
-            changed = true;
-        }
+    let xmp_rating = extract_xmp_rating(content);
 
-        let xmp_label = extract_xmp_label(&content);
-        let xmp_tags = extract_xmp_tags(&content);
+    if xmp_rating == Some(XMP_REJECTED_RATING) && metadata.flag.is_none() {
+        metadata.flag = Some(ImageFlag::Reject);
+        changed = true;
+    }
 
-        let mut current_tags = metadata.tags.clone().unwrap_or_default();
-        let original_len = current_tags.len();
-        let had_no_tags = metadata.tags.is_none();
+    if metadata.rating == 0
+        && let Some(rating) = xmp_rating.and_then(|r| u8::try_from(r).ok())
+        && rating != 0
+    {
+        metadata.rating = rating;
+        changed = true;
+    }
 
-        for tag in xmp_tags {
-            let tag = unescape(&tag).map_or(tag.clone(), Cow::into_owned);
-            if !current_tags.contains(&tag) {
-                current_tags.push(tag);
-            }
-        }
+    let xmp_label = extract_xmp_label(content);
+    let xmp_tags = extract_xmp_tags(content);
 
-        if let Some(label) = xmp_label {
-            let label = unescape(&label).map_or(label.clone(), Cow::into_owned);
-            let label_tag = format!("{}{}", COLOR_TAG_PREFIX, label.to_lowercase());
-            if !current_tags.contains(&label_tag) {
-                current_tags.retain(|t| !t.starts_with(COLOR_TAG_PREFIX));
-                current_tags.push(label_tag);
-            }
-        }
+    let mut current_tags = metadata.tags.clone().unwrap_or_default();
+    let original_len = current_tags.len();
+    let had_no_tags = metadata.tags.is_none();
 
-        if current_tags.len() != original_len || (had_no_tags && !current_tags.is_empty()) {
-            metadata.tags = Some(current_tags);
-            changed = true;
+    for tag in xmp_tags {
+        let tag = unescape(&tag).map_or(tag.clone(), Cow::into_owned);
+        if !current_tags.contains(&tag) {
+            current_tags.push(tag);
         }
     }
+
+    if let Some(label) = xmp_label {
+        let label = unescape(&label).map_or(label.clone(), Cow::into_owned);
+        let label_tag = format!("{}{}", COLOR_TAG_PREFIX, label.to_lowercase());
+        if !current_tags.contains(&label_tag) {
+            current_tags.retain(|t| !t.starts_with(COLOR_TAG_PREFIX));
+            current_tags.push(label_tag);
+        }
+    }
+
+    if current_tags.len() != original_len || (had_no_tags && !current_tags.is_empty()) {
+        metadata.tags = Some(current_tags);
+        changed = true;
+    }
+
     changed
+}
+
+/// Returns the XMP packet embedded in the image itself, for seeding the primary
+/// sidecar of an image seen for the first time.
+///
+/// This runs while listing folders, so it only opens files that can carry the
+/// packet in EXIF tag 700: TIFF, DNG, and TIFF-based raws. Virtual copies and
+/// cloud placeholders (which would have to be downloaded) are skipped.
+pub fn embedded_xmp_for_import(source_path: &Path, sidecar_path: &Path) -> Option<String> {
+    let ext = source_path.extension()?.to_str()?.to_ascii_lowercase();
+    let may_carry_tag_700 = matches!(ext.as_str(), "tif" | "tiff" | "dng")
+        || crate::decode::formats::is_raw_file(source_path);
+    if !may_carry_tag_700
+        || sidecar_path != crate::metadata::sidecar::get_primary_sidecar_path(source_path)
+        || crate::library::file_ops::is_cloud_placeholder(source_path)
+    {
+        return None;
+    }
+    let bytes = crate::library::file_ops::read_file_mapped(source_path).ok()?;
+    if !crate::metadata::exif_processing::is_tiff(&bytes) {
+        return None;
+    }
+    crate::metadata::exif_processing::extract_embedded_xmp(&bytes)
 }
 
 static XMP_LOCK: Mutex<()> = Mutex::new(());
