@@ -970,3 +970,141 @@ pub fn truncate_large_exif(value: &str) -> String {
 
     value.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/metadata")
+            .join(name);
+        fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {}", path.display(), e))
+    }
+
+    fn assert_jxl_exif(name: &str, bytes: &[u8]) {
+        assert!(is_jxl_bytes(bytes), "{name}: not detected as JPEG XL");
+
+        let exif = read_exif(bytes).unwrap_or_else(|| panic!("{name}: no EXIF"));
+        let make = exif.get_field(exif::Tag::Make, In::PRIMARY).unwrap();
+        assert_eq!(
+            clean_ascii_value(&make.value).as_deref(),
+            Some("TestCam"),
+            "{name}"
+        );
+        let orientation = exif
+            .get_field(exif::Tag::Orientation, In::PRIMARY)
+            .and_then(|f| f.value.get_uint(0));
+        assert_eq!(orientation, Some(6), "{name}");
+    }
+
+    #[test]
+    fn reads_exif_from_jxl_containers() {
+        for name in ["exif.jxl", "exif-brob.jxl", "exif-jpeg-recon.jxl"] {
+            let bytes = fixture(name);
+            assert_jxl_exif(name, &bytes);
+
+            let map = extract_metadata(&bytes).unwrap_or_else(|| panic!("{name}: no metadata"));
+            assert_eq!(
+                map.get("Make").map(String::as_str),
+                Some("TestCam"),
+                "{name}"
+            );
+            assert!(
+                map.contains_key("PhotographicSensitivity"),
+                "{name}: {map:?}"
+            );
+        }
+    }
+
+    /// Rewrites a JXL container so its Exif (or brob-wrapped Exif) box comes
+    /// last with a size of 0, i.e. extends to the end of the file.
+    fn move_exif_box_to_end(bytes: &[u8]) -> Vec<u8> {
+        let mut boxes = Vec::new();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let size = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            assert!(size >= 8, "unexpected box size {size}");
+            boxes.push(&bytes[pos..pos + size]);
+            pos += size;
+        }
+        let is_exif =
+            |b: &&[u8]| &b[4..8] == b"Exif" || (&b[4..8] == b"brob" && &b[8..12] == b"Exif");
+        let exif = *boxes.iter().find(|b| is_exif(b)).expect("Exif box");
+
+        let mut out: Vec<u8> = boxes
+            .iter()
+            .filter(|b| !is_exif(b))
+            .flat_map(|b| b.iter().copied())
+            .collect();
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&exif[4..]);
+        out
+    }
+
+    #[test]
+    fn reads_exif_from_trailing_jxl_box() {
+        for name in ["exif.jxl", "exif-brob.jxl"] {
+            let bytes = move_exif_box_to_end(&fixture(name));
+            assert_jxl_exif(&format!("{name} (trailing)"), &bytes);
+        }
+    }
+
+    #[test]
+    fn bare_jxl_codestream_has_no_exif() {
+        let bytes = fixture("bare.jxl");
+        assert!(is_jxl_bytes(&bytes));
+        assert!(read_exif(&bytes).is_none());
+    }
+
+    #[test]
+    fn non_jxl_files_use_container_reader() {
+        let jpeg = fixture("base.jpg");
+        assert!(!is_jxl_bytes(&jpeg));
+        assert!(read_exif(&jpeg).is_some());
+        assert!(!is_jxl_bytes(&fixture("tiff-plain.tif")));
+    }
+
+    #[test]
+    fn extracts_embedded_xmp_packet() {
+        let xmp = extract_embedded_xmp(&fixture("xmp-rated.tif")).expect("XMP packet");
+        assert!(xmp.contains("x:xmpmeta"));
+        assert!(xmp.contains("landscape"));
+
+        assert!(extract_embedded_xmp(&fixture("tiff-plain.tif")).is_none());
+        assert!(extract_embedded_xmp(&fixture("exif.jxl")).is_none());
+    }
+
+    #[test]
+    fn skips_binary_blobs_in_metadata() {
+        let bytes = fixture("xmp-rated.tif");
+        // The ~3KB XMP packet (tag 700) would otherwise render as a byte list.
+        let xmp_key = exif::Tag(exif::Context::Tiff, 700).to_string();
+        // Raw files go through extract_metadata; everything else through the
+        // generic path in read_exif_data_from_bytes. Both must filter blobs.
+        let maps = [
+            extract_metadata(&bytes).expect("metadata"),
+            read_exif_data_from_bytes("xmp-rated.tif", &bytes),
+        ];
+        for map in maps {
+            assert_eq!(map.get("Make").map(String::as_str), Some("TestCam"));
+            assert!(
+                !map.contains_key(&xmp_key),
+                "XMP blob leaked: {:?}",
+                map.get(&xmp_key)
+            );
+        }
+    }
+
+    #[test]
+    fn long_user_comment_is_not_a_blob() {
+        let field = |tag, len| exif::Field {
+            tag,
+            ifd_num: In::PRIMARY,
+            value: Value::Undefined(vec![b'a'; len], 0),
+        };
+        assert!(!is_binary_blob(&field(exif::Tag::UserComment, 300)));
+        assert!(is_binary_blob(&field(exif::Tag::MakerNote, 300)));
+        assert!(!is_binary_blob(&field(exif::Tag::MakerNote, 64)));
+    }
+}

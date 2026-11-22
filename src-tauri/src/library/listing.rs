@@ -681,3 +681,134 @@ pub fn get_supported_file_types() -> Result<serde_json::Value, String> {
         "nonRaw": non_raw_extensions
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::sidecar::{get_primary_sidecar_path, load_sidecar};
+
+    const RATED: &str = "xmp-rated.tif";
+    const REJECTED: &str = "xmp-rejected.tif";
+    const PLAIN: &str = "tiff-plain.tif";
+
+    /// Copies a fixture into a fresh temp dir, returning (dir guard, image, primary sidecar).
+    fn stage(name: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join(name);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/metadata")
+            .join(name);
+        fs::copy(fixture, &image).unwrap();
+        let sidecar = get_primary_sidecar_path(&image);
+        (dir, image, sidecar)
+    }
+
+    fn resolve(image: &Path, sidecar: &Path, xmp_sync: bool) -> ImageFileMetadata {
+        resolve_image_metadata(
+            image,
+            sidecar,
+            sidecar.exists(),
+            xmp_sync,
+            &AppSettings::default(),
+        )
+    }
+
+    #[test]
+    fn seeds_sidecar_from_embedded_xmp() {
+        let (_dir, image, sidecar) = stage(RATED);
+        let metadata = resolve(&image, &sidecar, true);
+
+        assert_eq!(metadata.rating, 3);
+        let tags = metadata.tags.unwrap();
+        for tag in ["landscape", "mountains", "color:red"] {
+            assert!(tags.iter().any(|t| t == tag), "missing {tag}: {tags:?}");
+        }
+        assert_eq!(load_sidecar(&sidecar).rating, 3);
+    }
+
+    #[test]
+    fn existing_sidecar_is_not_reseeded() {
+        let (_dir, image, sidecar) = stage(RATED);
+        fs::write(
+            &sidecar,
+            serde_json::to_string(&ImageMetadata::default()).unwrap(),
+        )
+        .unwrap();
+
+        let metadata = resolve(&image, &sidecar, true);
+        assert_eq!(metadata.rating, 0);
+        assert!(metadata.tags.is_none());
+    }
+
+    #[test]
+    fn virtual_copies_are_not_seeded() {
+        let (dir, image, _) = stage(RATED);
+        let copy_sidecar = dir.path().join(format!("{RATED}.abc123.rrdata"));
+        let metadata = resolve(&image, &copy_sidecar, true);
+        assert_eq!(metadata.rating, 0);
+        assert!(!copy_sidecar.exists());
+    }
+
+    #[test]
+    fn embedded_reject_rating_sets_flag() {
+        let (_dir, image, sidecar) = stage(REJECTED);
+        let metadata = resolve(&image, &sidecar, true);
+        assert!(matches!(metadata.flag, Some(ImageFlag::Reject)));
+        assert_eq!(metadata.rating, 0);
+    }
+
+    #[test]
+    fn no_sidecar_written_without_xmp() {
+        let (_dir, image, sidecar) = stage(PLAIN);
+        let metadata = resolve(&image, &sidecar, true);
+        assert_eq!(metadata.rating, 0);
+        assert!(!sidecar.exists());
+    }
+
+    #[test]
+    fn external_xmp_sidecar_still_syncs() {
+        let (_dir, image, sidecar) = stage(PLAIN);
+        fs::write(
+            image.with_extension("xmp"),
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="4" xmp:Label="Blue"/></rdf:RDF></x:xmpmeta>"#,
+        )
+        .unwrap();
+
+        let metadata = resolve(&image, &sidecar, true);
+        assert_eq!(metadata.rating, 4);
+        assert!(metadata.tags.unwrap().iter().any(|t| t == "color:blue"));
+    }
+
+    #[test]
+    fn external_xmp_takes_precedence_over_embedded() {
+        let (_dir, image, sidecar) = stage(RATED);
+        fs::write(
+            image.with_extension("xmp"),
+            r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmp:Rating="4" xmp:Label="Blue"/></rdf:RDF></x:xmpmeta>"#,
+        )
+        .unwrap();
+
+        let metadata = resolve(&image, &sidecar, true);
+        assert_eq!(metadata.rating, 4);
+        let tags = metadata.tags.unwrap();
+        assert!(tags.iter().any(|t| t == "color:blue"), "{tags:?}");
+        assert!(!tags.iter().any(|t| t == "landscape"), "{tags:?}");
+    }
+
+    #[test]
+    fn non_tiff_files_are_not_opened_for_embedded_xmp() {
+        let (dir, rated, _) = stage(RATED);
+        let renamed = dir.path().join("xmp-rated.jpg");
+        fs::rename(&rated, &renamed).unwrap();
+        assert!(embedded_xmp_for_import(&renamed, &get_primary_sidecar_path(&renamed)).is_none());
+    }
+
+    #[test]
+    fn embedded_xmp_ignored_without_xmp_sync() {
+        let (_dir, image, sidecar) = stage(RATED);
+        let metadata = resolve(&image, &sidecar, false);
+        assert_eq!(metadata.rating, 0);
+        assert!(metadata.tags.is_none());
+        assert!(!sidecar.exists());
+    }
+}

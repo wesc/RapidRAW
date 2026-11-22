@@ -1671,3 +1671,34 @@ pub async fn load_image(
         is_embedded_preview: is_embedded_preview(&source_path_str),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> Vec<u8> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/metadata")
+            .join(name);
+        std::fs::read(&path).unwrap_or_else(|e| panic!("reading {}: {}", path.display(), e))
+    }
+
+    /// The fixtures are a 16x12 image tagged with EXIF Orientation 6 (rotate 90°),
+    /// so a correctly oriented decode is 12x16. JPEG XL also carries the rotation
+    /// in its codestream, which the decoder applies itself; re-applying the EXIF
+    /// tag would turn the image upside down (back to 16x12).
+    #[test]
+    fn orientation_is_applied_once() {
+        jxl_image_rs_integration::register_image_decoding_hook();
+        for name in [
+            "base.jpg",
+            "exif.jxl",
+            "exif-brob.jxl",
+            "exif-jpeg-recon.jxl",
+        ] {
+            let decoded = decode_with_orientation(&fixture(name), &None)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(decoded.rgb.dimensions(), (12, 16), "{name}");
+        }
+    }
+}

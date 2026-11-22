@@ -303,3 +303,38 @@ pub fn sync_metadata_to_xmp(
         let _ = write_file_atomic(&xmp_file, content.as_bytes());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const XMP: &str = r#"<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmp:Rating="3" xmp:Label="Red"><dc:subject><rdf:Bag><rdf:li>landscape</rdf:li></rdf:Bag></dc:subject></rdf:Description></rdf:RDF></x:xmpmeta>"#;
+
+    #[test]
+    fn applies_rating_label_and_keywords() {
+        let mut metadata = ImageMetadata::default();
+        assert!(apply_xmp_content_to_metadata(XMP, &mut metadata));
+        assert_eq!(metadata.rating, 3);
+        let tags = metadata.tags.unwrap();
+        assert!(tags.iter().any(|t| t == "landscape"), "{tags:?}");
+        assert!(tags.iter().any(|t| t == "color:red"), "{tags:?}");
+    }
+
+    #[test]
+    fn does_not_override_existing_rating() {
+        let mut metadata = ImageMetadata {
+            rating: 5,
+            ..Default::default()
+        };
+        assert!(apply_xmp_content_to_metadata(XMP, &mut metadata));
+        assert_eq!(metadata.rating, 5);
+        assert!(metadata.tags.unwrap().iter().any(|t| t == "landscape"));
+    }
+
+    #[test]
+    fn reapplying_is_a_no_op() {
+        let mut metadata = ImageMetadata::default();
+        apply_xmp_content_to_metadata(XMP, &mut metadata);
+        assert!(!apply_xmp_content_to_metadata(XMP, &mut metadata));
+    }
+}
